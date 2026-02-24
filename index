@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Audio Aptitud Checker</title>
+  <style>
+    body{font-family:Arial, sans-serif; margin:24px; max-width:900px}
+    .card{border:1px solid #ddd; border-radius:14px; padding:16px; margin-top:16px}
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    .pill{border:1px solid #ddd; border-radius:999px; padding:6px 10px; display:inline-block}
+    .good{font-weight:700}
+    .bad{font-weight:700}
+    pre{background:#f7f7f7; padding:12px; border-radius:12px; overflow:auto}
+    button{padding:10px 14px; border-radius:12px; border:1px solid #ddd; cursor:pointer}
+    input{padding:8px}
+    small{color:#666}
+  </style>
+</head>
+<body>
+  <h1>Sube tu canción (WAV/MP3) y revisa si está “Apta” técnicamente</h1>
+  <p><small>
+    Evalúa EQ/balance espectral + nivel/picos. Para “afinación y mezcla de voces” real (voz vs instrumental),
+    se necesita backend (separación de stems).
+  </small></p>
+
+  <div class="card">
+    <input id="file" type="file" accept=".wav,.mp3,.m4a,.ogg,.flac"/>
+    <button id="analyze">Analizar</button>
+    <span id="status" class="pill"></span>
+  </div>
+
+  <div id="out" class="card" style="display:none">
+    <div class="row">
+      <span id="verdict" class="pill"></span>
+      <span id="score" class="pill"></span>
+      <span id="peak" class="pill"></span>
+      <span id="rms" class="pill"></span>
+    </div>
+
+    <h3>EQ / Balance por bandas (dB aprox)</h3>
+    <div class="row" id="bands"></div>
+
+    <h3>Alertas</h3>
+    <ul id="alerts"></ul>
+
+    <h3>Detalles (JSON)</h3>
+    <pre id="json"></pre>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function hann(n){
+    const w = new Float32Array(n);
+    for(let i=0;i<n;i++) w[i] = 0.5*(1-Math.cos(2*Math.PI*i/(n-1)));
+    return w;
+  }
+
+  // FFT mínimo radix-2 (MVP). Para producción, usar librería FFT.
+  function fftReIm(re, im){
+    const n = re.length;
+    for (let i=1, j=0; i<n; i++){
+      let bit = n>>1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i<j){
+        [re[i], re[j]]=[re[j], re[i]];
+        [im[i], im[j]]=[im[j], im[i]];
+      }
+    }
+    for (let len=2; len<=n; len<<=1){
+      const ang = -2*Math.PI/len;
+      const wlenRe = Math.cos(ang);
+      const wlenIm = Math.sin(ang);
+      for (let i=0; i<n; i+=len){
+        let wRe=1, wIm=0;
+        for (let j=0; j<len/2; j++){
+          const uRe = re[i+j], uIm = im[i+j];
+          const vRe = re[i+j+len/2]*wRe - im[i+j+len/2]*wIm;
+          const vIm = re[i+j+len/2]*wIm + im[i+j+len/2]*wRe;
+          re[i+j] = uRe + vRe;
+          im[i+j] = uIm + vIm;
+          re[i+j+len/2] = uRe - vRe;
+          im[i+j+len/2] = uIm - vIm;
+          const nextRe = wRe*wlenRe - wIm*wlenIm;
+          const nextIm = wRe*wlenIm + wIm*wlenRe;
+          wRe=nextRe; wIm=nextIm;
+        }
+      }
+    }
+  }
+
+  function db(x){ return 20*Math.log10(x + 1e-12); }
+
+  function bandDb(avgMag, freqs, lo, hi){
+    let sum=0, c=0;
+    for(let i=0;i<freqs.length;i++){
+      if(freqs[i]>=lo && freqs[i]<hi){
+        sum += avgMag[i];
+        c++;
+      }
+    }
+    const m = (c>0) ? (sum/c) : 1e-12;
+    return db(m);
+  }
+
+  function rms(y){
+    let s=0;
+    for(let i=0;i<y.length;i++) s += y[i]*y[i];
+    return Math.sqrt(s / Math.max(1,y.length));
+  }
+
+  function peak(y){
+    let p=0;
+    for(let i=0;i<y.length;i++){
+      const a = Math.abs(y[i]);
+      if(a>p) p=a;
+    }
+    return p;
+  }
+
+  function toMono(audioBuffer){
+    const n = audioBuffer.length;
+    const ch = audioBuffer.numberOfChannels;
+    const out = new Float32Array(n);
+    for(let c=0;c<ch;c++){
+      const data = audioBuffer.getChannelData(c);
+      for(let i=0;i<n;i++) out[i] += data[i]/ch;
+    }
+    return out;
+  }
+
+  async function decodeFile(file){
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const arr = await file.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arr);
+    return {ctx, buf};
+  }
+
+  function spectralAvg(y, sr){
+    const nfft = 4096;
+    const hop = 1024;
+    const win = hann(nfft);
+    const bins = nfft/2 + 1;
+    const avg = new Float32Array(bins);
+    let frames = 0;
+
+    for(let start=0; start + nfft <= y.length; start += hop){
+      const re = new Float32Array(nfft);
+      const im = new Float32Array(nfft);
+      for(let i=0;i<nfft;i++) re[i] = y[start+i] * win[i];
+      fftReIm(re, im);
+
+      for(let k=0;k<bins;k++){
+        const mag = Math.hypot(re[k], im[k]);
+        avg[k] += mag;
+      }
+      frames++;
+      if(frames>1200) break; // límite MVP
+    }
+
+    for(let k=0;k<bins;k++) avg[k] = avg[k] / Math.max(1,frames);
+
+    const freqs = new Float32Array(bins);
+    for(let k=0;k<bins;k++) freqs[k] = k * sr / nfft;
+
+    return {avg, freqs};
+  }
+
+  function scoreAndVerdict(metrics){
+    let score = 100;
+    const alerts = [];
+
+    // Picos/clipping
+    if(metrics.peakDb > -0.5){
+      score -= 15;
+      alerts.push("Picos demasiado cerca de 0 dBFS: riesgo de clipping/distorsión.");
+    } else if(metrics.peakDb > -1.0){
+      score -= 8;
+      alerts.push("Picos altos: recomendado dejar margen (≈ -1 dBFS o menos).");
+    }
+
+    // RMS (aprox)
+    if(metrics.rmsDb < -22){
+      score -= 10;
+      alerts.push("Nivel general bajo (RMS bajo): puede sentirse débil frente a otras canciones.");
+    }
+    if(metrics.rmsDb > -10){
+      score -= 8;
+      alerts.push("Nivel general muy alto (RMS alto): posible compresión excesiva/fatiga.");
+    }
+
+    // EQ heurística
+    if(metrics.boomy > 8){ score -= 8; alerts.push("Exceso de graves vs medios (boomy)."); }
+    if(metrics.muddy > 6){ score -= 8; alerts.push("Exceso en 200–400 Hz (muddy)."); }
+    if(metrics.harsh > 8){ score -= 8; alerts.push("Exceso en 2–5 kHz (harsh)."); }
+    if(metrics.sibilant > 6){ score -= 6; alerts.push("Sibilancia/brillo agresivo (6–10 kHz)."); }
+
+    score = Math.max(0, Math.min(100, score));
+    const verdict = (score >= 75) ? "APTA" : "NO APTA";
+    return {score, verdict, alerts};
+  }
+
+  $("analyze").onclick = async () => {
+    const f = $("file").files[0];
+    if(!f) return;
+
+    $("status").textContent = "Analizando...";
+    $("out").style.display = "none";
+    $("alerts").innerHTML = "";
+    $("bands").innerHTML = "";
+
+    try{
+      const {ctx, buf} = await decodeFile(f);
+      const sr = buf.sampleRate;
+      const y = toMono(buf);
+
+      const p = peak(y);
+      const r = rms(y);
+      const peakDb = 20*Math.log10(p + 1e-12);
+      const rmsDb = 20*Math.log10(r + 1e-12);
+
+      const {avg, freqs} = spectralAvg(y, sr);
+
+      const low   = bandDb(avg, freqs, 20, 120);
+      const mud   = bandDb(avg, freqs, 200, 400);
+      const box   = bandDb(avg, freqs, 400, 800);
+      const pres  = bandDb(avg, freqs, 2000, 5000);
+      const sib   = bandDb(avg, freqs, 6000, 10000);
+      const air   = bandDb(avg, freqs, 10000, 16000);
+
+      const metrics = {
+        sampleRate: sr,
+        peakDb,
+        rmsDb,
+        bands: {low, mud, box, presence: pres, sibilance: sib, air},
+        boomy: (low - box),
+        muddy: (mud - box),
+        harsh: (pres - box),
+        sibilant: (sib - pres)
+      };
+
+      const verdictPack = scoreAndVerdict(metrics);
+
+      $("status").textContent = "Listo ✅";
+      $("out").style.display = "block";
+
+      $("verdict").textContent = `Veredicto: ${verdictPack.verdict}`;
+      $("verdict").className = "pill " + (verdictPack.verdict === "APTA" ? "good" : "bad");
+      $("score").textContent = `Score: ${verdictPack.score.toFixed(1)} / 100`;
+      $("peak").textContent = `Peak: ${metrics.peakDb.toFixed(1)} dBFS`;
+      $("rms").textContent = `RMS: ${metrics.rmsDb.toFixed(1)} dB`;
+
+      for(const [k,v] of Object.entries(metrics.bands)){
+        const span = document.createElement("span");
+        span.className = "pill";
+        span.textContent = `${k}: ${v.toFixed(1)} dB`;
+        $("bands").appendChild(span);
+      }
+
+      for(const a of verdictPack.alerts){
+        const li = document.createElement("li");
+        li.textContent = a;
+        $("alerts").appendChild(li);
+      }
+
+      $("json").textContent = JSON.stringify({metrics, ...verdictPack}, null, 2);
+      ctx.close();
+    }catch(e){
+      $("status").textContent = "Error ❌ " + (e.message || e);
+    }
+  };
+</script>
+</body>
+</html>
